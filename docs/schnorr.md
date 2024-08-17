@@ -17,11 +17,11 @@
 
 Tagged hashes in Bitcoin are a way to create domain-separated hashes,
 ensuring that different applications or protocols using the same hashing
-function do not accidentally interfere with each other. This concept is par-
-ticularly important for security and integrity in cryptographic applications.
-$$tagged\_hash(tag, data) = hash(hash(tag) | hash(tag) | data)$$
-Tagged hashes are used in various parts of the Bitcoin protocol, in-
-cluding BIP-Schnorr signatures and Taproot. These applications benefit
+function do not accidentally interfere with each other. This concept is particularly important for security and integrity in cryptographic applications.
+
+$$tagged_hash(tag, data) = hash(hash(tag) | hash(tag) | data)$$
+
+Tagged hashes are used in various parts of the Bitcoin protocol, including BIP-Schnorr signatures and Taproot. These applications benefit
 from the domain separation provided by tagged hashes, which enhances
 security and prevents unintended interactions between different parts of
 the protocol.
