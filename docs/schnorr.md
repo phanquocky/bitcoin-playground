@@ -84,9 +84,9 @@ And check sG is or not equal S
 
 - Set $challenge = tagged\_hash(”BIP 0340/challenge”, x(R) | x(P ) | m)$
 - $$S = R + challenge * P$$
-- $$S = R + challeng * dG$$
+- $$S = R + challenge * dG$$
   because P = dG
-- $$S = (k + challeng * d)G$$
+- $$S = (k + challenge * d)G$$
   because R = kG
 - $$⇒ S = sG$$
 
