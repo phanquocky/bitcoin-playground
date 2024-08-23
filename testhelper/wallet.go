@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -75,4 +77,24 @@ func (s *TestSuite) ExportWIFPriv(wallet *wallet.Wallet) *btcutil.WIF {
 	assert.Nil(s.T, err)
 
 	return wif
+}
+
+func (s *TestSuite) GetKeypairWithEvenY(seed string) (KeyPair, secp256k1.JacobianPoint) {
+	_, keyPair := s.NewHDKeyPairFromSeed(seed)
+
+	var publicPoint btcec.JacobianPoint
+	keyPair.Pub.AsJacobian(&publicPoint)
+
+	if publicPoint.Y.IsOdd() {
+
+		keyPair.priv.Key.Negate()
+		btcec.ScalarBaseMultNonConst(&keyPair.priv.Key, &publicPoint)
+		publicPoint.ToAffine()
+
+		keyPair.Pub = btcec.NewPublicKey(&publicPoint.X, &publicPoint.Y)
+	}
+
+	assert.Equal(s.T, false, publicPoint.Y.IsOdd())
+
+	return keyPair, publicPoint
 }
