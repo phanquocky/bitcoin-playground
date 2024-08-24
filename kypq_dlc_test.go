@@ -1,10 +1,14 @@
-// This package is used to test the dlc scheme package
-// small goal of this package is to test the dlc scheme package
-// 1. Read about Signature Adaptor, ref: https://bitcoinops.org/en/topics/adaptor-signatures/
-// 2. Code the adaptor signature
-// 3. Read about DLC, ref:https://lists.launchpad.net/mimblewimble/msg00485.html, https://bitcoinops.org/en/topics/discreet-log-contracts/, ...
-// 4. Code the DLC
-// 5. Document
+// This package is for testing the DLC (Discreet Log Contract) implementation.
+// ref:
+// 1. https://bitcoinops.org/en/topics/discreet-log-contracts/
+// 2. https://adiabat.github.io/dlc.pdf (original paper)
+// 3. https://github.com/aljazceru/discreet-log-contracts (github resource)
+// 4. https://livestream.com/accounts/2261474/events/9019383/videos/202643580 (video MIT Bitcoin Expo 2020)
+
+// TODO:
+// 1. Read about DLC and understand the concept
+// 2. Code POC the DLC
+// 3. Document
 package main
 
 import (
@@ -12,287 +16,210 @@ import (
 	"log"
 	"testing"
 
+	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/nghuyenthevinh2000/bitcoin-playground/testhelper"
 	"github.com/stretchr/testify/assert"
 )
 
-// Test_Adaptor_Signature tests the adaptor signature, ref: https://bitcoinops.org/en/topics/adaptor-signatures/
-// Test the basic scheme of the adaptor signature using basic swap token between two parties Alice and Bob. Alice swap 1 BTC with Bob for 1000 USDT
-// 1. Alice create a Adaptor Signature for the swap. She tweaks the signature with a secret value t, and send the tweaked signature to Bob (Adaptor Signature)
-// 2. Bob verifies the Adaptor and if it is correct. He create his own Adaptor base on the Alice's Adaptor, this Adaptor is valid to claim the 1000 USDT
-// 3. When Alice claim the 1000 USDT, she will reveal the secret t to Bob, and Bob can verify the secret t with the Adaptor to claim the 1 BTC
-func Test_Adaptor_Signature2(t *testing.T) {
+// This Test_DLC is for testing the DLC implementation
+// The context:
+// 1. Alice and Bob are the two parties
+// 2. Olivia is the oracle
+
+// Alice and Bob want to create the contract if Tomorow is a rainy day, Alice will pay Bob 1 BTC, otherwise Bob will pay Alice 1 BTC.
+// Olivia is the oracle who will provide the weather information.
+
+// Steps:
+// 1. Contract creatation: Alice and Bob create the contract each other.
+// 2. CET (Contract Execution Transaction): Alice and Bob create the CET with the oracle signature.
+// 3. Oracle signing: Tomorow Signumber with Precommit R value.
+// 4. Contract Execution: Alice and Bob execute the contract.
+func Test_DLC(t *testing.T) {
 	s := testhelper.TestSuite{}
 	s.SetupStaticSimNetSuite(t, log.Default())
 
-	alicePair, alicePoint := s.GetKeypairWithEvenY(ALICE_WALLET_SEED)
+	// Oracle setup
+	oliviaPair, oliviaPoint := s.GetKeypairWithEvenY(OLIVIA_WALLET_SEED)
+	rPair, rPoint := s.GetKeypairWithEvenY("")
+
+	// 1. Contract creatation
+	// Alice and Bob send 1BTC to the multisig address
+	alicePair, _ := s.GetKeypairWithEvenY(ALICE_WALLET_SEED)
 	bobPair, bobPoint := s.GetKeypairWithEvenY(BOB_WALLET_SEED)
 
-	// 1. Alice create a Adaptor Signature for the swap. She tweaks the signature with a secret value t, and send the tweaked signature to Bob (Adaptor Signature)
-	T, tPoint := s.GetKeypairWithEvenY("") // T = tG
-	R, rPoint := s.GetKeypairWithEvenY("") // R = rG nonce
+	// Generate a nonce
+	aliceNonce, err := musig2.GenNonces(musig2.WithPublicKey(alicePair.Pub))
+	assert.Nil(t, err)
 
-	tx1 := sha256.Sum256([]byte("Alice send 1 BTC to Bob"))
-	tx2 := sha256.Sum256([]byte("Bob send 1000 USDT to Alice"))
+	bobNonce, err := musig2.GenNonces(musig2.WithPublicKey(bobPair.Pub))
+	assert.Nil(t, err)
 
-	// aggrPoint = R + T = rPoint + tPoint
-	var aggrPoint btcec.JacobianPoint
-	btcec.AddNonConst(&rPoint, &tPoint, &aggrPoint)
-	aggrPoint.ToAffine()
-	for aggrPoint.Y.IsOdd() {
-		log.Printf("AggrPoint.Y is odd\n")
-		T, tPoint = s.GetKeypairWithEvenY("") // T = tG
-		R, rPoint = s.GetKeypairWithEvenY("") // R = rG nonce
-		btcec.AddNonConst(&rPoint, &tPoint, &aggrPoint)
-		aggrPoint.ToAffine()
+	// aggregate the nonce
+	aggrNonce, err := musig2.AggregateNonces([][66]byte{aliceNonce.PubNonce, bobNonce.PubNonce})
+	assert.Nil(t, err)
+
+	aggrPubKey, _, _, err := musig2.AggregateKeys([]*btcec.PublicKey{alicePair.Pub, bobPair.Pub}, false)
+	assert.NoError(t, err)
+
+	p2taprootScript, err := txscript.NewScriptBuilder().AddOp(txscript.OP_1).AddData(schnorr.SerializePubKey(aggrPubKey.FinalKey)).Script() // NewScriptBuilder().AddOp(OP_1).AddData(q).Script()
+	assert.Nil(t, err)
+
+	txHash1, err := chainhash.NewHashFromStr("aff48a9b83dc525d330ded64e1b6a9e127c99339f7246e2c89e06cd83493af9b") // this is a Alice Output
+	assert.Nil(t, err)
+
+	txHash2, err := chainhash.NewHashFromStr("4f8d9e23cb7b6a8d56e1a9a7b0451dca0df72305fbf3e7b5ac9b8a376f93f1a2") // this is Bob Output
+	assert.Nil(t, err)
+
+	tx := wire.NewMsgTx(2)
+
+	tx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  *txHash1,
+			Index: 0,
+		}})
+	tx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  *txHash2,
+			Index: 0,
+		}})
+	txOut := &wire.TxOut{
+		Value: 2000000000, PkScript: p2taprootScript,
 	}
+	tx.AddTxOut(txOut)
 
-	// commitment = tagged_hash("BIP0340/challenge", (R + T)_x | P_x | tx1)
-	commitment := chainhash.TaggedHash(chainhash.TagBIP0340Challenge, aggrPoint.X.Bytes()[:], alicePoint.X.Bytes()[:], tx1[:])
+	aliceSig, err := txscript.SignatureScript(tx, 0, []byte{}, txscript.SigHashSingle, alicePair.GetTestPriv(), true)
+	assert.Nil(t, err)
+	tx.TxIn[0].SignatureScript = aliceSig
 
+	bobSig, err := txscript.SignatureScript(tx, 1, []byte{}, txscript.SigHashSingle, bobPair.GetTestPriv(), true)
+	assert.Nil(t, err)
+	tx.TxIn[1].SignatureScript = bobSig
+
+	// add the transaction to the blockchain
+	blockUtxos := blockchain.NewUtxoViewpoint()
+	blockUtxos.AddTxOut(btcutil.NewTx(tx), 0, 0)
+
+	// 2. CET (Contract Execution Transaction)
+	// Alice and Bob already create mutisig output it have 2BTC. Now they want to create the set of Transactions respectively with the weather information (Rainy or Cloudy or Sunny)
+	// IF rainy, Multisig output will pay to Bob 2BTC
+	// IF Cloudy, Multisig output will pay to Alice 1BTC and Bob 1BTC
+	// IF Sunny, Multisig output will pay to Alice 2BTC
+	// Create 3 pairs of transactions
+
+	// 2.1 Rainy case
+	tx_21 := wire.NewMsgTx(2)
+	tx_21.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  tx.TxHash(),
+			Index: 0,
+		}})
+	// bobPub21 := bobPoint + si*G , si*G = R - Hash("rainny", R) * V , V = oliviaPoint, R = rPoint
+	commitment := sha256.Sum256(append([]byte("rainny"), rPoint.X.Bytes()[:]...))
 	var e btcec.ModNScalar
-	ok := e.SetBytes((*[32]byte)(commitment))
-	assert.Equal(s.T, ok, uint32(0), "commitment is overflow")
+	overflow := e.SetBytes((*[32]byte)(&commitment))
+	assert.Equal(s.T, overflow, uint32(0), "overflow commitment")
 
-	// tweakS = s' = r + e*AlicePriv
-	tweakS := new(btcec.ModNScalar).Mul2(&e, &alicePair.GetTestPriv().Key).Add(&R.GetTestPriv().Key)
-
-	// --> Alice's Adaptor is (R, T, s'), ALice send this value to Bob
-
-	// 2.1 Bob verifies the Adaptor and if it is correct. s'G ?= R + e*AlicePub
-	var result, right, left btcec.JacobianPoint
-	btcec.ScalarMultNonConst(&e, &alicePoint, &result) // e * AlicePub
+	e.Negate() // -e = -Hash("rainny", R)
+	var result btcec.JacobianPoint
+	btcec.ScalarMultNonConst(&e, &oliviaPoint, &result) // -Hash("rainny", R) * V
 	result.ToAffine()
-	btcec.AddNonConst(&rPoint, &result, &right) // R + e*AlicePub = right
-	right.ToAffine()
 
-	btcec.ScalarBaseMultNonConst(tweakS, &left) // s'G = left
-	left.ToAffine()
+	var bobPub21Point btcec.JacobianPoint
+	btcec.AddNonConst(&rPoint, &result, &bobPub21Point) // R - Hash("rainny", R) * V
+	bobPub21Point.ToAffine()
 
-	assert.Equal(s.T, left, right) // left ?= right
+	btcec.AddNonConst(&bobPoint, &bobPub21Point, &bobPub21Point) // bobPub21Point = bobPublic + si*G = bobPublice + R - Hash("rainny", R) * V
+	bobPub21Point.ToAffine()
 
-	// 2.2 Bob create his own
-	bobRPair, bobRPoint := s.GetKeypairWithEvenY("") // R' = r'G nonce
+	bobPub21 := btcec.NewPublicKey(&bobPub21Point.X, &bobPub21Point.Y)
+	pkScript21, err := txscript.NewScriptBuilder().AddOp(txscript.OP_1).AddData(schnorr.SerializePubKey(bobPub21)).Script()
+	assert.Nil(s.T, err)
+	tx_21.AddTxOut(&wire.TxOut{
+		Value: 2000000000, PkScript: pkScript21,
+	})
+	inputFetcher := txscript.NewCannedPrevOutputFetcher(
+		tx.TxOut[0].PkScript,
+		tx.TxOut[0].Value,
+	)
+	tx_21SigHash := txscript.NewTxSigHashes(tx_21, inputFetcher)
+	signatureHash, err := txscript.CalcTaprootSignatureHash(tx_21SigHash, txscript.SigHashDefault, tx_21, 0, inputFetcher)
+	assert.Nil(s.T, err)
 
-	var BobAggrPoint btcec.JacobianPoint
-	btcec.AddNonConst(&bobRPoint, &tPoint, &BobAggrPoint)
-	BobAggrPoint.ToAffine()
+	aliceSignature, err := musig2.Sign(aliceNonce.SecNonce, alicePair.GetTestPriv(), aggrNonce, []*secp256k1.PublicKey{alicePair.Pub, bobPair.Pub}, ([32]byte)(signatureHash))
+	assert.Nil(t, err)
+	// Alice send tx_21 to Bob, Bob will wait for the oracle signature (rainny), and then sign the transaction to claim 2BTC
 
-	// get bobRPoint --> BobAggrPoint.Y is even
-	for BobAggrPoint.Y.IsOdd() || bobRPoint.Y.IsOdd() {
-		log.Print("BobAggrPoint.Y is odd\n")
-		bobRPair, bobRPoint = s.GetKeypairWithEvenY("")
-		btcec.AddNonConst(&bobRPoint, &tPoint, &BobAggrPoint)
-		BobAggrPoint.ToAffine()
-	}
-	if BobAggrPoint.Y.IsOdd() {
-		log.Printf("BobAggrPoint.Y is odd, hi vong khong vao day 2 lan because the T is netigate 2 times\n")
-	}
+	// 3. Oracle signing
+	// Olivia will sign the message with the precommit R value, and broadcast it to the network
+	// 3.1 Case Rainy
 
-	// commitment = tagged_hash("BIP0340/challenge", R'_x + T_x | P_x | tx2)
-	commitment = chainhash.TaggedHash(chainhash.TagBIP0340Challenge, BobAggrPoint.X.Bytes()[:], bobPoint.X.Bytes()[:], tx2[:])
+	// oliviaSig = r - Hash("rainny", R) * oliviaPriv , e = - Hash("rainny", R)
+	oliviaSig := new(btcec.ModNScalar).Mul2(&e, &oliviaPair.GetTestPriv().Key).Add(&rPair.GetTestPriv().Key) // --> Broadcast to the network, to confirm it is a rainy day
 
-	var bobE btcec.ModNScalar
-	ok = bobE.SetBytes((*[32]byte)(commitment))
-	assert.Equal(s.T, ok, uint32(0), "commitment is overflow")
+	// 4. Contract Execution
+	// 4.1 Bob get oliviaSig and reconize that it value is Rainy and claim 2BTC
 
-	// sBob = r' + e * p sinature of Bob
-	sBob := new(btcec.ModNScalar).Mul2(&bobE, &bobPair.GetTestPriv().Key).Add(&bobRPair.GetTestPriv().Key)
+	bobSignature, err := musig2.Sign(bobNonce.SecNonce, bobPair.GetTestPriv(), aggrNonce, []*secp256k1.PublicKey{alicePair.Pub, bobPair.Pub}, ([32]byte)(signatureHash))
+	assert.Nil(t, err)
 
-	// --> Bob's Adaptor is (R', T, sBob), Bob send this value to Alice
+	fullSignature := musig2.CombineSigs(bobSignature.R, []*musig2.PartialSignature{aliceSignature, bobSignature})
 
-	// 3.1 Alice using Bob's Adaptor to claim the 1000 USDT
-	sign := sBob.Add(&T.GetTestPriv().Key)
-	signature := schnorr.NewSignature(&BobAggrPoint.X, sign)
+	oke := fullSignature.Verify((signatureHash), aggrPubKey.FinalKey)
+	assert.Equal(s.T, oke, true)
+	log.Printf("Signature is valid : %v \n", oke)
 
-	oke := signature.Verify(tx2[:], bobPair.Pub)
+	tx_21.TxIn[0].Witness = wire.TxWitness{fullSignature.Serialize()}
 
+	sigCache := txscript.NewSigCache(5)
+	hashCache := txscript.NewHashCache(5)
+
+	err = blockchain.ValidateTransactionScripts(
+		btcutil.NewTx(tx_21), blockUtxos, txscript.StandardVerifyFlags, sigCache, hashCache,
+	)
+	assert.Nil(s.T, err)
+
+	blockUtxos.AddTxOut(btcutil.NewTx(tx_21), 0, 2)
+
+	// 4.2 Bob claim 2 BTC from tx_21 output
+	bobNewPrivateKey := new(btcec.ModNScalar).Add2(&bobPair.GetTestPriv().Key, oliviaSig)
+	tx_bob := wire.NewMsgTx(2)
+	tx_bob.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  tx_21.TxHash(),
+			Index: 0,
+		}})
+	tx_bob.AddTxOut(&wire.TxOut{
+		Value: 2000000000, PkScript: bobPair.Pub.SerializeCompressed(),
+	})
+	inputFetcher = txscript.NewCannedPrevOutputFetcher(
+		tx_21.TxOut[0].PkScript,
+		tx_21.TxOut[0].Value,
+	)
+	tx_bobSigHash := txscript.NewTxSigHashes(tx_bob, inputFetcher)
+	signatureHash, err = txscript.CalcTaprootSignatureHash(tx_bobSigHash, txscript.SigHashDefault, tx_bob, 0, inputFetcher)
+	assert.Nil(s.T, err)
+
+	bobSign, err := schnorr.Sign(btcec.PrivKeyFromScalar(bobNewPrivateKey), signatureHash)
+	assert.Nil(s.T, err)
+
+	oke = bobSign.Verify(signatureHash, bobPub21)
 	assert.Equal(s.T, oke, true)
 
-	// 3.2 Bob get the Alice Signature and get the secrete t
-	// sBobNegate = -sBob
-	sBobNegate := new(btcec.ModNScalar).Mul2(&bobE, &bobPair.GetTestPriv().Key).Add(&bobRPair.GetTestPriv().Key).Negate()
-	secrete := sign.Add(sBobNegate)
-	assert.Equal(t, secrete.Equals(&T.GetTestPriv().Key), true)
+	tx_bob.TxIn[0].Witness = wire.TxWitness{bobSign.Serialize()}
 
-	// 3.3 Bob using Alice Transaction
-	aliceSign := tweakS.Add(secrete)
+	err = blockchain.ValidateTransactionScripts(
+		btcutil.NewTx(tx_bob), blockUtxos, txscript.StandardVerifyFlags, sigCache, hashCache,
+	)
 
-	aliceSignature := schnorr.NewSignature(&aggrPoint.X, aliceSign)
-	oke = aliceSignature.Verify(tx1[:], alicePair.Pub)
-	assert.Equal(s.T, oke, true)
+	assert.Nil(s.T, err)
+
+	// DONE :)
 }
-
-// func Test_Adaptor_Signature(t *testing.T) {
-// 	s := testhelper.TestSuite{}
-// 	s.SetupStaticSimNetSuite(t, log.Default())
-
-// 	_, alicePair := s.NewHDKeyPairFromSeed(ALICE_WALLET_SEED)
-// 	_, bobPair := s.NewHDKeyPairFromSeed(BOB_WALLET_SEED)
-
-// 	// 1. Alice create a Adaptor Signature for the swap. She tweaks the signature with a secret value t, and send the tweaked signature to Bob (Adaptor Signature)
-// 	_, T := s.NewHDKeyPairFromSeed("") // T = tG
-// 	_, R := s.NewHDKeyPairFromSeed("") // R = rG nonce
-
-// 	var (
-// 		TPoint     btcec.JacobianPoint
-// 		RPoint     btcec.JacobianPoint
-// 		AlicePoint btcec.JacobianPoint
-// 		BobPoint   btcec.JacobianPoint
-// 	)
-
-// 	T.Pub.AsJacobian(&TPoint)
-// 	R.Pub.AsJacobian(&RPoint)
-// 	alicePair.Pub.AsJacobian(&AlicePoint)
-// 	bobPair.Pub.AsJacobian(&BobPoint)
-
-// 	if BobPoint.Y.IsOdd() {
-// 		log.Println("BobPoint is odd")
-// 		bobPair.GetTestPriv().Key.Negate()
-// 		btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&bobPair.GetTestPriv().Key), &BobPoint)
-// 		BobPoint.ToAffine()
-// 	}
-// 	if AlicePoint.Y.IsOdd() {
-// 		log.Println("Alice Point is odd")
-// 		alicePair.GetTestPriv().Key.Negate()
-// 		btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&alicePair.GetTestPriv().Key), &AlicePoint)
-// 		AlicePoint.ToAffine()
-// 	}
-// 	if TPoint.Y.IsOdd() {
-// 		T.GetTestPriv().Key.Negate()
-// 		btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&T.GetTestPriv().Key), &TPoint)
-// 		TPoint.ToAffine()
-// 	}
-// 	if RPoint.Y.IsOdd() {
-// 		R.GetTestPriv().Key.Negate()
-// 		btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&R.GetTestPriv().Key), &RPoint)
-// 		RPoint.ToAffine()
-// 	}
-
-// 	msg := []byte("Alice send 1 BTC to Bob")
-// 	tx1 := sha256.Sum256(msg)
-
-// 	var AggrPoint btcec.JacobianPoint
-// 	btcec.AddNonConst(&RPoint, &TPoint, &AggrPoint)
-// 	AggrPoint.ToAffine()
-// 	if AggrPoint.Y.IsOdd() {
-// 		log.Printf("AggrPoint.Y is odd\n")
-// 		R.GetTestPriv().Key.Negate()
-// 		T.GetTestPriv().Key.Negate()
-// 	}
-
-// 	btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&R.GetTestPriv().Key), &RPoint)
-// 	btcec.ScalarBaseMultNonConst(new(btcec.ModNScalar).Add(&T.GetTestPriv().Key), &TPoint)
-
-// 	// commitment = tagged_hash("BIP0340/challenge", (R + T)_x | P_x | tx1)
-// 	commitment := chainhash.TaggedHash(chainhash.TagBIP0340Challenge, AggrPoint.X.Bytes()[:], AlicePoint.X.Bytes()[:], tx1[:])
-
-// 	var e btcec.ModNScalar
-// 	ok := e.SetBytes((*[32]byte)(commitment))
-// 	assert.Equal(s.T, ok, uint32(0), "commitment is overflow")
-
-// 	// tweakS = s' = r + e*AlicePriv
-// 	tweakS := new(btcec.ModNScalar).Mul2(&e, &alicePair.GetTestPriv().Key).Add(&R.GetTestPriv().Key)
-
-// 	// --> Alice's Adaptor is (R, T, s'), ALice send this value to Bob
-
-// 	// 2.1 Bob verifies the Adaptor and if it is correct. s'G ?= R + e*AlicePub
-// 	var result, right, left btcec.JacobianPoint
-// 	btcec.ScalarMultNonConst(&e, &AlicePoint, &result)
-// 	result.ToAffine()
-// 	btcec.AddNonConst(&RPoint, &result, &right)
-// 	right.ToAffine()
-
-// 	btcec.ScalarBaseMultNonConst(tweakS, &left)
-// 	left.ToAffine()
-
-// 	log.Printf("result: %v\n", result)
-// 	log.Printf("right: %v\n", right.X)
-// 	log.Printf("left: %v\n", left.X)
-// 	log.Printf("is equal: %v\n", right.X.Equals(&left.X))
-
-// 	assert.Equal(s.T, left, right)
-
-// 	// 2.2 Bob create his own
-// 	_, bobRPair := s.NewHDKeyPairFromSeed("") // R' = r'G nonce
-// 	var (
-// 		bobRPoint btcec.JacobianPoint
-// 	)
-// 	bobRPair.Pub.AsJacobian(&bobRPoint)
-
-// 	msg = []byte("Bob send 1000 USDT to Alice")
-// 	tx2 := sha256.Sum256(msg)
-
-// 	var BobAggrPoint btcec.JacobianPoint
-// 	btcec.AddNonConst(&bobRPoint, &TPoint, &BobAggrPoint)
-// 	BobAggrPoint.ToAffine()
-
-// 	// if BobAggrPoint.Y.IsOdd() {
-// 	// 	log.Printf("BobAggrPoint.Y is odd, hi vong khong vao day 2 lan because the T is netigate 2 times\n")
-// 	// 	bobRPair.GetTestPriv().Key.Negate()
-// 	// 	T.GetTestPriv().Key.Negate()
-// 	// }
-
-// 	for BobAggrPoint.Y.IsOdd() || bobRPoint.Y.IsOdd() {
-// 		_, bobRPair = s.NewHDKeyPairFromSeed("")
-// 		bobRPair.Pub.AsJacobian(&bobRPoint)
-// 		btcec.AddNonConst(&bobRPoint, &TPoint, &BobAggrPoint)
-// 		BobAggrPoint.ToAffine()
-// 	}
-
-// 	log.Printf("BobAggrPoint: %v, %v\n", BobAggrPoint, BobAggrPoint.Y.IsOdd())
-
-// 	// commitment = tagged_hash("BIP0340/challenge", R'_x + T_x | P_x | tx2)
-// 	commitment = chainhash.TaggedHash(chainhash.TagBIP0340Challenge, BobAggrPoint.X.Bytes()[:], BobPoint.X.Bytes()[:], tx2[:])
-
-// 	log.Printf("commitment gen: %v\n", commitment)
-
-// 	var bobE btcec.ModNScalar
-// 	ok = bobE.SetBytes((*[32]byte)(commitment))
-// 	assert.Equal(s.T, ok, uint32(0), "commitment is overflow")
-
-// 	log.Printf("bobE: %v\n", bobE)
-// 	// sBob = r' + e * p
-
-// 	//rt = r' + t
-// 	rt := new(btcec.ModNScalar).Add2(&bobRPair.GetTestPriv().Key, &T.GetTestPriv().Key)
-
-// 	var BobAggrPoint2 btcec.JacobianPoint
-// 	btcec.ScalarBaseMultNonConst(rt, &BobAggrPoint2)
-// 	BobAggrPoint2.ToAffine()
-// 	log.Printf("BobAggrPoint: %v \n", BobAggrPoint)
-// 	log.Printf("BobAggrPoint2: %v \n", BobAggrPoint2)
-// 	assert.Equal(t, BobAggrPoint, BobAggrPoint2)
-
-// 	sBob := new(btcec.ModNScalar).Mul2(&bobE, &bobPair.GetTestPriv().Key).Add(&bobRPair.GetTestPriv().Key)
-
-// 	// --> Bob's Adaptor is (R', T, sBob), Bob send this value to Alice
-
-// 	// 3.1 Alice using Bob's Adaptor to claim the 1000 USDT
-// 	sign := sBob.Add(&T.GetTestPriv().Key)
-// 	signature := schnorr.NewSignature(&BobAggrPoint.X, sign)
-
-// 	oke := signature.Verify(tx2[:], bobPair.Pub)
-
-// 	assert.Equal(s.T, oke, true)
-
-// 	// 3.2 Bob get the Alice Signature and get the secrete t
-// 	// sBobNegate = -sBob
-// 	sBobNegate := new(btcec.ModNScalar).Mul2(&bobE, &bobPair.GetTestPriv().Key).Add(&bobRPair.GetTestPriv().Key).Negate()
-// 	// log.Printf("sBobNeg: %v, sBob: %v \n", sBobNeg, sBob)
-// 	secrete := sign.Add(sBobNegate)
-// 	log.Printf("Secrete: %v \n", secrete)
-// 	log.Printf("T.GetPrivkey: %v\n", T.GetTestPriv().Key)
-// 	log.Printf("isEqual: %v\n", secrete.Equals(&T.GetTestPriv().Key))
-// 	assert.Equal(t, secrete.Equals(&T.GetTestPriv().Key), true)
-
-// 	// 3.3 Bob using Alice Transaction
-// 	aliceSign := tweakS.Add(secrete)
-
-// 	aliceSignature := schnorr.NewSignature(&AggrPoint.X, aliceSign)
-// 	oke = aliceSignature.Verify(tx1[:], alicePair.Pub)
-// 	assert.Equal(s.T, oke, true)
-// }
